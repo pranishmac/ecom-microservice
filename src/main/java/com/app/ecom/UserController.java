@@ -1,5 +1,7 @@
 package com.app.ecom;
 
+import com.app.ecom.dto.UserDto;
+import com.app.ecom.dto.UserRequestDto;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -15,13 +17,13 @@ public class UserController {
     private final UserService userService;
 
     @GetMapping("/api/users")
-    public ResponseEntity<List<User>> getAllUsers() {
+    public ResponseEntity<List<UserDto>> getAllUsers() {
         return ResponseEntity.ok(userService.fetchAllUsers());
     }
 
     @GetMapping("/api/users/{id}")
-    public ResponseEntity<User> getUserById(@PathVariable Long id) {
-        User user = userService.fetchUser(id);
+    public ResponseEntity<UserDto> getUserById(@PathVariable Long id) {
+        UserDto user = userService.fetchUser(id);
         if (user == null) {
             return ResponseEntity.notFound().build();
         }
@@ -29,18 +31,18 @@ public class UserController {
     }
 
     @PostMapping("/api/users")
-    public ResponseEntity<User> createUser(@RequestBody User user) {
-        userService.addUser(user);
+    public ResponseEntity<UserDto> createUser(@RequestBody UserRequestDto request) {
+        UserDto created = userService.createUser(request);
         URI location = ServletUriComponentsBuilder.fromCurrentRequest()
                 .path("/{id}")
-                .buildAndExpand(user.getId())
+                .buildAndExpand(created.getId())
                 .toUri();
-        return ResponseEntity.created(location).body(user);
+        return ResponseEntity.created(location).body(created);
     }
 
     @PutMapping("/api/users/{id}")
-    public ResponseEntity<String> updateUser(@PathVariable Long id, @RequestBody User updatedUser){
-        boolean updated =  userService.updateUser(id, updatedUser);
+    public ResponseEntity<String> updateUser(@PathVariable Long id, @RequestBody UserRequestDto request){
+        boolean updated =  userService.updateUser(id, request);
         if(updated) return ResponseEntity.ok("User added successfully");
 
         return  ResponseEntity.notFound().build();

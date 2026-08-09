@@ -1,6 +1,5 @@
 package com.app.ecom;
 
-import com.fasterxml.jackson.annotation.JsonManagedReference;
 import jakarta.persistence.CascadeType;
 import jakarta.persistence.Entity;
 import jakarta.persistence.FetchType;
@@ -31,7 +30,6 @@ public class User {
 
     @ToString.Exclude
     @EqualsAndHashCode.Exclude
-    @JsonManagedReference
     @OneToOne(cascade = CascadeType.ALL, fetch = FetchType.LAZY, orphanRemoval = true)
     @JoinColumn(name = "address_id", referencedColumnName = "id", unique = true)
     private Address address;
