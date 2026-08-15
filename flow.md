@@ -1,6 +1,11 @@
 
 # Code Flow Map
 
+> Package structure is feature-based (`com.app.ecom.user`, `.product`, `.cart`,
+> `.order`, `.common.exception`) — see decision.md, 2026-08-15. Class names
+> below are unqualified; the call flows themselves are unaffected by the
+> restructure since no logic changed, only file locations.
+
 ## User module
 
 `UserController.getAllUsers()`
