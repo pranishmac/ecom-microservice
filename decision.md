@@ -70,3 +70,64 @@
 **Reason:** `VIA_DTO` serializes `Page<T>` through Spring Data's documented `PagedModel` shape (`content` + `page: {size, number, totalElements, totalPages}`) instead of relying on `PageImpl`'s undocumented internal structure, which Spring explicitly warns isn't stable across versions.
 **Alternatives considered:** Spring HATEOAS's `PagedResourcesAssembler` — heavier, adds a new dependency for a problem `VIA_DTO` already solves with a one-line annotation.
 **Files touched:** EcomApplication.java
+
+## [2026-08-15 02:10] Identify "current user" for cart/order endpoints via path variable
+
+**Context:** Cart and Order are the first "belongs to a user" resources in an app with no authentication layer (no Spring Security, no session, no JWT). Every prior endpoint took an explicit resource `{id}`; cart/order needed a way to know *which user's* cart/orders are being acted on.
+**Decision:** `/api/users/{userId}/cart/...` and `/api/users/{userId}/orders/...` — `userId` as an explicit path variable, threaded from controller through service as a plain `Long` parameter. Confirmed via AskUserQuestion over the alternative (a custom `X-User-Id` header).
+**Reason:** Matches the existing `/api/users/{id}` convention already used everywhere else in this codebase, and is no less secure than any other endpoint today (none are secured). Threading `userId` as a plain method parameter through the service layer, rather than pulling it from request state inside the service, means swapping in real authentication later only touches the controller layer (extracting `userId` from an `Authentication`/`SecurityContext` instead of `@PathVariable`) — the service signatures don't change.
+**Alternatives considered:** `X-User-Id` header on top-level `/api/cart`, `/api/orders` — closer to how a real gateway/security-filter might forward a resolved identity, but not chosen; both are equally spoofable today, and the path-variable form stays consistent with the rest of the app.
+**Files touched:** CartController.java, OrderController.java, CartService.java, OrderService.java
+
+## [2026-08-15 02:10] Model Cart/CartItem and Order/OrderItem
+
+**Context:** Needed a cart system (add/remove/fetch) and an Order entity/repo backing a "place order" checkout flow.
+**Decision:**
+- `Cart` — one per user, `@OneToOne` owning the `user_id` FK (unique), created lazily on first add-to-cart rather than eagerly at user-creation time. Holds `items` (`@OneToMany`, cascade `ALL` + `orphanRemoval`).
+- `CartItem` — `@ManyToOne` to `Cart` and `Product`; DB-level `UNIQUE(cart_id, product_id)` so a product can only have one line item per cart (adding an already-present product increments its `quantity` instead of inserting a duplicate row).
+- `Order` — `@ManyToOne` to `User` (not `@OneToOne` — a user places many orders over time), `items` (`@OneToMany` cascade `ALL`), `status` (`OrderStatus`: `PENDING`/`CONFIRMED`/`CANCELLED`), `totalAmount` (persisted, not derived — see reasoning below), `shippingAddress` (`@Embeddable ShippingAddress`, copied at order-placement time), `@Version` for optimistic locking.
+- `OrderItem` — snapshots `productName`/`unitPrice` at order time (so later price/name changes on `Product` don't retroactively rewrite historical orders) while *also* keeping a nullable `@ManyToOne Product` reference (for live navigation back to the product, e.g. "buy again").
+- **No `@Version` on `Cart`/`CartItem`**, unlike `Product`/`Order` — deliberately. `@Version` only protects concurrent `UPDATE`s to the entity's *own* row; adding/removing a `CartItem` is an `INSERT`/`DELETE` on the `cart_items` table, not an `UPDATE` on `carts`, so a `Cart`-level version would never actually increment on the operations that matter here. The real protection against a duplicate-insert race is the DB `UNIQUE(cart_id, product_id)` constraint.
+**Reason:** `totalAmount` is persisted (not derived like `Product.inStock` or the DTO-level `lineTotal` fields) because it represents the committed amount for a completed transaction — it must stay fixed even if `Product.price` changes afterward, so it can't be recomputed live. The reference-plus-snapshot split on `OrderItem` is the standard trade-off: snapshot what must stay historically accurate, keep a live reference for what's fine to be current.
+**Alternatives considered:** `@OneToOne` for `Order.user` — rejected, a user legitimately has many orders. `@Version` on `Cart` for the "double-click add to cart" race — rejected once traced through (see above); the unique constraint is the actual guard, and `@Version` there would be theater, not protection.
+**Files touched:** Cart.java, CartItem.java, Order.java, OrderItem.java, OrderStatus.java, ShippingAddress.java, CartRepository.java, OrderRepository.java
+
+## [2026-08-15 02:10] Reuse `ProductService.adjustStock` for checkout stock changes, don't duplicate the rule
+
+**Context:** Placing an order must decrement stock (and fail cleanly if insufficient); cancelling an order must restore it. `ProductService.adjustStock(id, delta)` already implements exactly this — validated, optimistically-locked, delta-based stock mutation — for the `PATCH /api/products/{id}/stock` endpoint.
+**Decision:** `OrderService` depends on `ProductService` (not `ProductRepository`) specifically for stock mutation, calling `productService.adjustStock(productId, -quantity)` on placement and `productService.adjustStock(productId, +quantity)` on cancellation. `CartService`, by contrast, depends on `ProductRepository` directly, since it needs an actual `Product` entity reference for the `CartItem.product` field, not a business operation — that split (call the service for a business rule, call the repository for a plain entity reference) is the general rule for when to reach for which.
+**Reason:** "Stock cannot go negative" is a business invariant that must have exactly one implementation. Since `ProductService` is a Spring bean and `OrderService`'s own `@Transactional` method is already an active transaction when it calls `productService.adjustStock(...)`, Spring's default `Propagation.REQUIRED` means the call *joins* the existing transaction rather than starting a nested one — so the whole checkout (stock decrements across every cart item, `Order`/`OrderItem` inserts, cart clearing) commits or rolls back as one atomic unit. If item 3 of 4 has insufficient stock, the `InsufficientStockException` triggers a rollback that undoes items 1–2's already-applied decrements too — no manual compensating logic needed. This was verified live: an oversized order attempt left both stock and the cart completely untouched.
+**Alternatives considered:** Duplicating the negative-stock check inside `OrderService` against `ProductRepository` directly — rejected, would mean two independent implementations of the same invariant that could drift.
+**Files touched:** OrderService.java
+
+## [2026-08-15 02:10] Cart fetch returns 200 with an empty cart, never 404
+
+**Context:** `GET /api/users/{userId}/cart` for a user who has never added anything has no `Cart` row in the database.
+**Decision:** `CartService.fetchCart` returns a representation of an empty cart (`items: []`, `totalAmount: 0`, `totalItems: 0`, `id: null`) rather than 404, without persisting anything.
+**Reason:** A cart conceptually always exists for a user (it's just usually empty) — a client shouldn't need special-case 404 handling on its cart-page load. `removeItem`, by contrast, still 404s when the cart or item doesn't exist, since removing something that was never there is unambiguously a not-found case, not an empty-state case.
+**Alternatives considered:** 404 for consistency with other "fetch by id" endpoints — rejected as worse API ergonomics for this specific resource shape.
+**Files touched:** CartService.java, CartMapper.java
+
+## [2026-08-15 02:10] Shipping address falls back to the user's saved Address
+
+**Context:** `Order.shippingAddress` needs a value at checkout time. The existing `User.address` (added earlier in the User–Address `@OneToOne` work) had no consumer yet.
+**Decision:** `PlaceOrderRequestDto.shippingAddress` is optional. If provided, it's used (mapped to the `ShippingAddress` embeddable); if omitted, falls back to the user's saved `Address`; if neither exists, throws `ShippingAddressRequiredException` (400).
+**Reason:** Standard checkout UX ("ship to my saved address, or enter a new one this time"), and it gives the existing `Address`/`User` relationship an actual consumer instead of remaining a feature nothing used.
+**Alternatives considered:** Requiring `shippingAddress` on every order request (simpler, rejected as unrealistic UX) — requiring a saved address to exist before ordering (rejected, blocks first-time checkout unnecessarily).
+**Files touched:** OrderService.java, OrderMapper.java, dto/PlaceOrderRequestDto.java, exception/ShippingAddressRequiredException.java
+
+## [2026-08-15 02:10] Order cancellation restores stock; double-cancel guarded
+
+**Context:** "Full flow of place order" naturally implies being able to view and cancel an order, not just create one — otherwise a failed/changed-mind checkout permanently locks up inventory.
+**Decision:** `POST /api/users/{userId}/orders/{orderId}/cancel` — rejects (`InvalidOrderStateException`, 409) if the order is already `CANCELLED`; otherwise restores stock for every line item via `productService.adjustStock(productId, +quantity)` and sets `status = CANCELLED`.
+**Reason:** Closes the loop the same way placement opened it — through the same single stock-mutation rule in `ProductService`, verified live (keyboard stock: 4 → 2 on order, → 4 again on cancel).
+**Alternatives considered:** Allowing cancellation of any order regardless of status — rejected, a re-cancel of an already-cancelled order would double-restore stock that was never actually taken.
+**Files touched:** OrderService.java, exception/InvalidOrderStateException.java
+
+## [2026-08-15 02:10] Add a stable sort tiebreaker to paginated listings
+
+**Context:** While adding `OrderRepository.findByUserId(userId, pageable)`, revisited a gap flagged in `notes.md` during the Product feature: sorting by a single non-unique column (`name`) gives pagination no deterministic tiebreaker for rows with equal sort-key values.
+**Decision:** `OrderController`'s default sort is `{"createdAt", "id"}` DESC. Also retroactively fixed `ProductController`'s default sort from `"name"` alone to `{"name", "id"}`.
+**Reason:** `id` is guaranteed unique and monotonically increasing, so it's a correct tiebreaker for any primary sort key that isn't itself unique — closes a previously-documented, easily-fixable gap while building the same pattern for a second endpoint.
+**Alternatives considered:** Leaving Product's sort as-is since it wasn't the current task — rejected; the fix was small, safe, and directly connected to what was already flagged.
+**Files touched:** OrderController.java, ProductController.java

@@ -49,7 +49,7 @@ public class ProductController {
     public ResponseEntity<Page<ProductDto>> getProducts(
             @RequestParam(required = false) ProductCategory category,
             @RequestParam(required = false) String search,
-            @PageableDefault(size = 20, sort = "name") Pageable pageable) {
+            @PageableDefault(size = 20, sort = {"name", "id"}) Pageable pageable) {
         return ResponseEntity.ok(productService.searchProducts(category, search, pageable));
     }
 

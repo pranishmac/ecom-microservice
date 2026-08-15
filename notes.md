@@ -297,14 +297,14 @@ Jackson never sees an entity; Hibernate never sees a DTO.
   `EcomApplication`, which routes serialization through Spring Data's
   documented `PagedModel` shape (`content` + `page: {size, number,
   totalElements, totalPages}`) instead.
-- **Known gap**: `sort = "name"` alone is not a stable sort key — `name` is
-  not unique, so two products with the same name don't have a deterministic
-  relative order across pages. In the general case this can cause an item
-  to be skipped or repeated across page boundaries if rows are
-  inserted/deleted between requests. The standard fix is a secondary
-  tiebreaker on a unique column, e.g. sort by `name, id` — not done here
-  since it wasn't reached in testing, but worth knowing before relying on
-  pagination stability at scale.
+- **Gap fixed during the Cart/Order work**: `sort = "name"` alone wasn't a
+  stable sort key — `name` isn't unique, so two products with the same name
+  had no deterministic relative order across pages, which can skip/repeat
+  rows across page boundaries under concurrent inserts/deletes. Fixed to
+  `sort = {"name", "id"}` — `id` is unique and monotonic, so it's a correct
+  tiebreaker for any non-unique primary sort key. Applied the same pattern
+  to `OrderController`'s listing (`{"createdAt", "id"}` DESC) from the
+  start, having learned the lesson here first.
 
 ## Repository method explosion vs. JPA Specifications
 
@@ -333,3 +333,189 @@ Jackson never sees an entity; Hibernate never sees a DTO.
   `UserService.updateUser` convention already in the codebase, and it makes
   the write intent explicit at the call site rather than relying on a
   reader knowing dirty-checking semantics implicitly.
+
+# Cart & Order deep dive
+
+Cart (add/remove/fetch) and Order (place/list/get/cancel), built on top of
+the same layering as User/Product. This section is the reasoning that's
+specific to *these* two domains — where they reuse established patterns is
+covered above, where they needed new judgment calls is here.
+
+## Aggregate root pattern: no `CartItemRepository`/`OrderItemRepository`
+
+- `CartItem` and `OrderItem` have entities and DB tables, but deliberately
+  no standalone Spring Data repository. All mutation goes through `Cart`
+  and `Order` respectively — `CartService` loads a `Cart`, mutates its
+  `items` collection in memory, and calls `cartRepository.save(cart)`;
+  `orphanRemoval = true` translates an in-memory `list.remove(...)` into a
+  `DELETE` on the child row at flush time.
+- This is the DDD "aggregate root" idea applied practically: `Cart` is the
+  consistency boundary. If `CartItemRepository` existed alongside it, any
+  code path could call `cartItemRepository.save(orphanCartItem)` or
+  `deleteById(...)` directly, bypassing whatever invariants `Cart` is
+  supposed to enforce (right now: the increment-on-duplicate-add rule) —
+  the invariant would only hold "as long as everyone remembers to go
+  through Cart," which isn't a guarantee, it's a convention someone will
+  eventually break. Not exposing the repository makes it structurally
+  impossible to bypass, not just discouraged.
+- Same reasoning applies to `Order`/`OrderItem`: an order's line items
+  don't have an independent lifecycle or their own business rules to
+  enforce, so there's nothing a separate repository would be *for*.
+
+## Why `@Version` protects `Order` but would be theater on `Cart`
+
+- This looked like the same problem at first ("concurrent modification of
+  a parent+children structure — add `@Version` to the parent") but the two
+  cases are actually different once you trace the generated SQL.
+- `@Version` works by having Hibernate append `AND version = ?` to the
+  `UPDATE` statement for the entity's own row, and increment the value in
+  the same statement. It's a compare-and-swap on that one row. `Order`'s
+  `cancelOrder` does exactly this: load the order, flip `status`, `save()`
+  — that `save()` is an `UPDATE orders SET status = ?, version = ? WHERE id
+  = ? AND version = ?`. Two concurrent cancel requests: the second one's
+  `UPDATE` matches zero rows (the version it read is now stale), Hibernate
+  raises `OptimisticLockingFailureException`, `GlobalExceptionHandler`
+  turns it into 409. This is real protection.
+- `Cart.addItem`'s race is different: adding a *new* product to the cart is
+  an `INSERT INTO cart_items`, not an `UPDATE carts`. A `@Version` field on
+  `Cart` would only increment when the `carts` row itself is updated — it
+  is not touched at all when a child row is inserted via a `mappedBy`
+  collection (the FK lives on `cart_items`, so nothing about `carts` itself
+  changes). Putting `@Version` on `Cart` would compile, look correct, and
+  do nothing for the actual race between two concurrent "add product X"
+  requests. That's why it isn't there — a decision that's easy to get
+  backwards without tracing through to the actual SQL each mapping
+  produces.
+- The real guard for the `CartItem` race is the DB-level
+  `UNIQUE(cart_id, product_id)` constraint, which is the same category of
+  protection — and the same category of *gap* — as the `Product.sku`
+  situation already documented above: `CartService.addItem` checks
+  "does a `CartItem` for this product already exist in `cart.items`"
+  in-memory before deciding to `INSERT` a new one. Two concurrent
+  first-time-adds of the same product can both pass that check before
+  either commits, then both attempt an `INSERT` — one succeeds, the other
+  hits the unique constraint and throws `DataIntegrityViolationException`,
+  which `GlobalExceptionHandler` has no handler for (falls through to a
+  500). Same shape of TOCTOU race, same unresolved gap, now in a second
+  place — which is itself useful signal: if this pattern shows up a third
+  time, it's worth building one shared way to handle
+  `DataIntegrityViolationException` → 409 generically instead of
+  special-casing it per resource.
+
+## Transaction propagation is what makes checkout atomic
+
+- `OrderService.placeOrder` is a single `@Transactional` method that, per
+  cart item, calls `productService.adjustStock(...)` — a method on a
+  *different* Spring bean, which is itself annotated `@Transactional`.
+- The mechanism that makes this safe: Spring's `@Transactional` defaults to
+  `Propagation.REQUIRED` — "run in the current transaction if one is
+  already active, otherwise start a new one." Since `OrderService`'s own
+  proxy already opened a transaction before `productService.adjustStock`
+  is called, the nested call *joins* that same physical transaction rather
+  than opening a second one. Concretely: one JDBC connection, one commit
+  point, for the entire `placeOrder` call — every stock decrement, the
+  `Order`/`OrderItem` inserts, and the cart-clearing all commit together or
+  roll back together.
+- This is *not* the classic Spring `@Transactional` self-invocation pitfall
+  (where calling a `@Transactional` method from another method *in the same
+  class* silently skips the proxy and the annotation does nothing). This
+  works correctly specifically because it's a **cross-bean** call —
+  `OrderService` holds an injected `ProductService` reference, so the call
+  goes through `ProductService`'s Spring-generated proxy, which is what
+  makes propagation-checking happen at all. Worth knowing precisely because
+  the failure mode (self-invocation) and the success mode (cross-bean
+  injection) look superficially similar in code and behave completely
+  differently.
+- Verified live: an order with an oversized quantity for one line item
+  threw `InsufficientStockException` partway through the loop, and neither
+  the already-processed line item's stock decrement nor the cart itself
+  showed any change afterward — confirming the rollback covered everything
+  the loop had done up to that point, not just the failing line.
+
+## Persisted `totalAmount` vs. everywhere else's "don't persist derived state" rule
+
+- Earlier in this document: `Product.inStock` isn't persisted because it's
+  a pure function of `stockQuantity`, and two fields that must always agree
+  is a bug waiting to happen. `Order.totalAmount` looks like the same
+  shape of problem (`sum(unitPrice * quantity)` across `OrderItem`s) but is
+  handled the opposite way — persisted, computed once at placement time.
+- The difference is what the field *means*. `Product.inStock` describes
+  *current* state — recomputing it is not just safe but required (if it
+  were persisted and stock changed, the stored value would immediately be
+  wrong). `Order.totalAmount` describes the amount the customer was
+  actually charged *at that moment* — a committed fact about a completed
+  transaction, not a live view over current data. If `Product.price`
+  changes next week, an order placed today must still show what was
+  actually paid, not a recalculated total using the new price. Persisting
+  it isn't redundant state here; it's the only correct place for that
+  value to live once the transaction is committed. (The per-line
+  `lineTotal` in `OrderItemDto`, by contrast, *is* computed at DTO-mapping
+  time from persisted `unitPrice * quantity` — those are just arithmetic
+  on values that are already frozen snapshots, not a live product lookup,
+  so recomputing them is free and safe the same way `inStock` is.)
+- Same reasoning is why `OrderItem` stores `productName`/`unitPrice`
+  snapshots rather than always reading live from `Product` through the
+  `@ManyToOne` reference it also keeps: the reference is for *navigation*
+  ("show me this product's current page"), the snapshot is for *the
+  historical record* ("this is what they were called/cost when this order
+  was placed"). Keeping both isn't redundancy, it's two different
+  questions with two different correct answers.
+
+## Threading `userId` as a plain parameter, not pulling it from request context
+
+- `CartController`/`OrderController` take `userId` as an explicit
+  `@PathVariable Long`, passed straight through to
+  `CartService`/`OrderService` as a plain method parameter — not resolved
+  from any kind of request-scoped "current user" context, because no such
+  context exists yet (no Spring Security, no session).
+- This was a genuine fork with no clearly-correct default (captured via
+  AskUserQuestion): path variable (`/api/users/{userId}/cart`) vs. a
+  `X-User-Id` header on top-level `/api/cart`. Path variable was chosen for
+  consistency with the existing `/api/users/{id}` convention already used
+  everywhere else in this app.
+- Threading it as an explicit parameter through the service layer (rather
+  than, say, having `CartService` reach into some ambient
+  `RequestContextHolder`-style state) is deliberate: it means the *only*
+  thing that changes when real authentication eventually arrives is the
+  controller layer — swap `@PathVariable Long userId` for `userId` pulled
+  off an `Authentication`/`Principal` (and probably keep the path variable
+  too, but assert it matches the authenticated identity rather than trust
+  it blindly). `CartService`/`OrderService`'s method signatures, and
+  everything below them, don't need to change at all. Designing the
+  service-layer boundary to not know or care *how* the caller identity was
+  established — only that it receives one — is what keeps that migration
+  small later instead of a rewrite.
+- **This is a known, explicit gap today, not a hidden one**: any client can
+  currently pass any `userId` and act on that user's cart/orders. Worth
+  stating plainly rather than leaving implicit, since it's the kind of gap
+  that's easy to forget was ever a placeholder once the code has been
+  sitting there for a while.
+
+## Cart fetch's 200-vs-404 choice, and why it doesn't generalize
+
+- `GET .../cart` returns 200 with an empty representation when no `Cart`
+  row exists; `GET .../orders/{id}` and `removeItem` both still 404 when
+  the row doesn't exist. This isn't an inconsistency — it's two different
+  resource shapes. A cart is conceptually singular-per-user and
+  always-logically-present (just usually empty); an order is one of
+  potentially many, individually created, individually addressable — there
+  is no sensible "empty order" to hand back for an ID that was never
+  created. The rule isn't "prefer 200 over 404," it's "return 404 exactly
+  when the client asked for something identifiable that doesn't exist, and
+  200 when the resource's *absence itself* is a valid, meaningful state of
+  that resource." Applying "friendly empty state" reasoning to
+  `getOrder(id)` would be wrong — a nonexistent order ID isn't "empty," it's
+  invalid.
+
+## What the optimistic-lock 409 does *not* do: no server-side retry
+
+- Both the Product PATCH stock endpoint and `OrderService.cancelOrder` can
+  throw `OptimisticLockingFailureException` under concurrent conflicting
+  writes, which `GlobalExceptionHandler` turns into 409 with a "please
+  retry" message. Worth being explicit that this is entirely the *client's*
+  responsibility — nothing in this codebase automatically retries a failed
+  optimistic-lock write. A caller that doesn't handle 409 by retrying (with
+  the now-current state) will simply see the operation fail. This is the
+  correct default (silent server-side retry loops hide real conflicts and
+  can mask bugs), but it's a contract the API consumer needs to know about,
+  not something implicit in "409 means try again eventually on its own."

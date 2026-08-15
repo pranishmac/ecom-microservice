@@ -75,4 +75,64 @@
 
 All `ProductService`/`UserService` exceptions are caught app-wide by `GlobalExceptionHandler` (`@RestControllerAdvice`) and converted to a JSON `ErrorResponse` body with the appropriate HTTP status — no controller-level try/catch.
 
-**Last changed:** 2026-08-15 — initial implementation of the full Product module (entity, repository, mapper, service, controller, DTOs, exception handling).
+**Last changed:** 2026-08-15 — default list sort changed from `"name"` to `{"name", "id"}` (stable pagination tiebreaker; `id` is unique, `name` isn't).
+
+## Cart module
+
+`CartController.getCart(userId)`
+  → `CartService.fetchCart(userId)`
+    → `UserRepository.findById(userId)` → throws `ResourceNotFoundException` (404) if empty
+    → `CartRepository.findByUserId(userId)`
+    → `CartMapper.toDto()` if a `Cart` row exists, else `CartMapper.emptyCart()` (200 with an empty cart, never 404 — see decision.md)
+
+`CartController.addItem(userId, AddToCartRequestDto)` — `@Valid`
+  → `CartService.addItem(userId, request)`
+    → `ProductRepository.findById(productId)` filtered to `active = true` → throws `ResourceNotFoundException` (404) if missing/inactive
+    → get-or-create the user's `Cart` (`CartRepository.findByUserId`, else build+save a new one after `UserRepository.findById` validates the user)
+    → scan `cart.items` for an existing line for this product: increment `quantity` if found, else append a new `CartItem`
+    → `CartRepository.save(cart)` (cascades the new/updated `CartItem`)
+    → `CartMapper.toDto(saved)`
+
+`CartController.removeItem(userId, productId)`
+  → `CartService.removeItem(userId, productId)`
+    → `CartRepository.findByUserId(userId)` → throws `ResourceNotFoundException` (404) if no cart
+    → `cart.items.removeIf(...)` matching `productId` → throws `ResourceNotFoundException` (404) if nothing removed (`orphanRemoval` deletes the row on save)
+    → `CartRepository.save(cart)`
+    → `CartMapper.toDto(saved)`
+
+**Last changed:** 2026-08-15 — initial implementation (Cart, CartItem, CartRepository, CartMapper, CartService, CartController).
+
+## Order module
+
+`OrderController.placeOrder(userId, PlaceOrderRequestDto)` — `@Valid`
+  → `OrderService.placeOrder(userId, request)`
+    → `UserRepository.findById(userId)` → throws `ResourceNotFoundException` (404) if empty
+    → `CartRepository.findByUserId(userId)` filtered to non-empty → throws `EmptyCartException` (409) if empty/missing
+    → resolve shipping address: request DTO if present, else `user.getAddress()`, else throws `ShippingAddressRequiredException` (400)
+    → for each `CartItem`: `ProductService.adjustStock(productId, -quantity)` (validates + decrements stock, joins this same transaction — throws `InsufficientStockException` (409) or `OptimisticLockingFailureException` (409) on failure, which rolls back everything already applied in this loop) → build a snapshot `OrderItem` (`productName`, `unitPrice` from the now-updated `Product`)
+    → `OrderRepository.save(order)` (cascades `OrderItem`s)
+    → clear `cart.items`, `CartRepository.save(cart)` (`orphanRemoval` deletes the old `CartItem` rows)
+    → `OrderMapper.toDto(saved)`
+
+`OrderController.getOrders(userId, Pageable)`
+  → `OrderService.listOrders(userId, pageable)`
+    → `UserRepository.existsById(userId)` → throws `ResourceNotFoundException` (404) if false
+    → `OrderRepository.findByUserId(userId, pageable)` (default sort `{createdAt, id}` DESC)
+    → `Page.map(OrderMapper::toDto)`
+
+`OrderController.getOrder(userId, orderId)`
+  → `OrderService.fetchOrder(userId, orderId)`
+    → `OrderRepository.findByIdAndUserId(orderId, userId)` → throws `ResourceNotFoundException` (404) if empty (also prevents fetching another user's order by guessing an id)
+    → `OrderMapper.toDto()`
+
+`OrderController.cancelOrder(userId, orderId)`
+  → `OrderService.cancelOrder(userId, orderId)`
+    → `OrderRepository.findByIdAndUserId(orderId, userId)` → throws `ResourceNotFoundException` (404) if empty
+    → throws `InvalidOrderStateException` (409) if already `CANCELLED`
+    → for each `OrderItem`: `ProductService.adjustStock(productId, +quantity)` (restores stock, same joined-transaction mechanism as placement)
+    → set `status = CANCELLED`, `OrderRepository.save(order)`
+    → `OrderMapper.toDto(saved)`
+
+All `OrderService`/`CartService` exceptions are caught by the same app-wide `GlobalExceptionHandler` as the User/Product modules — no controller-level try/catch here either.
+
+**Last changed:** 2026-08-15 — initial implementation (Order, OrderItem, OrderStatus, ShippingAddress, OrderRepository, OrderMapper, OrderService, OrderController), plus the Cart module above.
