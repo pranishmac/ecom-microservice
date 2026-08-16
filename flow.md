@@ -6,6 +6,30 @@
 > below are unqualified; the call flows themselves are unaffected by the
 > restructure since no logic changed, only file locations.
 
+## Operational endpoints (Actuator)
+
+Not part of the request flow above — no `Controller → Service → Repository`
+chain, since these are Spring Boot's own built-in endpoint handlers, not
+application code. Listed here because they're a second, separate HTTP
+surface this app exposes, on its own port:
+
+- **Port 8080** (`server.port`): the business API — everything in the module
+  sections below.
+- **Port 8081** (`management.server.port`): `/actuator/health`, `/info`,
+  `/metrics`, `/prometheus`, `/loggers`, `/beans`, `/env`, `/mappings`,
+  `/shutdown`. Two independent embedded Tomcat connectors in the same JVM —
+  verified live that each 404s on the other's port.
+
+`health` reads the same `DataSource` the JPA modules below use (via
+Spring Boot's auto-registered `db` `HealthIndicator`) — the one place this
+operational surface touches application state. Everything else
+(`metrics`, `beans`, `loggers`, etc.) reflects JVM/Spring-framework state,
+not this app's business data.
+
+See `notes.md` for the reasoning (why a separate port, why `shutdown`
+needed an explicit access override, graceful shutdown vs. the `/shutdown`
+endpoint) and `decision.md` (2026-08-16) for the dated decision record.
+
 ## User module
 
 `UserController.getAllUsers()`

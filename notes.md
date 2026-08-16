@@ -519,3 +519,207 @@ covered above, where they needed new judgment calls is here.
   correct default (silent server-side retry loops hide real conflicts and
   can mask bugs), but it's a contract the API consumer needs to know about,
   not something implicit in "409 means try again eventually on its own."
+
+# Actuator deep dive
+
+Spring Boot Actuator adds an operational surface — health, metrics, logs,
+runtime introspection — separate from the business API. This section is
+about the reasoning specific to *that* surface: why it's isolated the way
+it is, what each endpoint actually does under the hood, and where the
+protection genuinely ends.
+
+## Why a separate port, and precisely what it does and doesn't guarantee
+
+- `management.server.port=8081` starts a **second, independent embedded
+  Tomcat connector** in the same JVM — not a path prefix on the same
+  connector. Verified live: `curl :8080/actuator/health` 404s, and
+  `curl :8081/api/products` 404s — genuinely two separate HTTP surfaces,
+  each blind to the other's routes.
+- What this buys: an actuator request literally cannot reach `/api/**`
+  handlers, and vice versa — there's no routing-rule mistake that could
+  cross the boundary, because there's no shared router.
+- What this does **not** buy: network reachability. If port `8081` is
+  published the same way `8080` is (e.g. a naive `docker run -p 8081:8081`
+  alongside `-p 8080:8080`, or a Kubernetes `Service` exposing both), the
+  isolation is purely cosmetic — anyone who can reach the container can
+  still call `/actuator/shutdown`. The actual security boundary is "port
+  8081 is not on any network path reachable from outside the deployment" —
+  a firewall rule, a container port mapping that only publishes `8080`, a
+  k8s `NetworkPolicy` restricting which pods can reach port `8081`. Spring
+  configuration cannot express or enforce any of that; it only makes the
+  boundary *possible* to enforce elsewhere. This is the load-bearing
+  caveat of the whole design — port separation is necessary, not
+  sufficient, and it's an infrastructure team's job to finish the job this
+  app started.
+
+## The `Access` model, and why `shutdown` needed a version-specific check
+
+- Spring Boot 3.4 replaced the old per-endpoint `management.endpoint.<id>.enabled`
+  boolean flags with a three-level `Access` enum: `NONE` (endpoint doesn't
+  respond at all), `READ_ONLY` (GET works, write operations don't),
+  `UNRESTRICTED` (full access). Each `@Endpoint`-annotated class declares
+  its own `defaultAccess` — confirmed by inspecting the actual `.class`
+  bytecode for this exact dependency version rather than assuming: the
+  `@Endpoint` annotation's own framework-wide default is `UNRESTRICTED`,
+  and every endpoint here (`health`, `info`, `metrics`, `loggers`, `beans`,
+  `env`, `mappings`) just inherits that — meaning simply adding an
+  endpoint's ID to `management.endpoints.web.exposure.include` is
+  sufficient to make it fully readable *and*, for endpoints with write
+  operations like `loggers`, writable too.
+- `ShutdownEndpoint` is the one exception in this codebase's endpoint set:
+  its `@Endpoint` annotation explicitly overrides `defaultAccess` to
+  `NONE`, so it stays completely disabled — 404, not even readable —
+  regardless of the exposure list, until something explicitly raises it
+  with `management.endpoint.shutdown.access=unrestricted`. This is a
+  deliberate, hard-coded "you must opt in twice" design from the framework
+  itself for exactly the operation that can take the whole app down.
+- Why this needed verifying against the actual jar rather than recalling
+  from memory: this behavior is version-specific. Older Spring Boot used a
+  single boolean (`management.endpoint.shutdown.enabled=true`) for the same
+  purpose — a plausible, wrong guess here would have produced a `shutdown`
+  endpoint that silently 404s, discovered only when actually needed (i.e.,
+  during an incident) rather than in testing. Verified instead by
+  extracting `ShutdownEndpoint.class` from the resolved
+  `spring-boot-actuator-4.1.0.jar` and reading the annotation's bytecode
+  directly, then confirmed live with a real `POST` that returned
+  `{"message":"Shutting down, bye..."}` and an actually-terminated process.
+- There's also a global ceiling worth knowing about even though it isn't
+  used here: `management.endpoints.access.max-permitted` (default
+  `unrestricted`) caps every endpoint's effective access regardless of
+  individual settings — a single knob to lock everything down at once if
+  ever needed (e.g. temporarily, during an incident), without touching each
+  endpoint's own configuration.
+
+## Health: composite status, and why `show-details=always` is fine *here specifically*
+
+- `/actuator/health`'s top-level `status` is an aggregate: Spring Boot
+  auto-registers a `HealthIndicator` per relevant auto-configured component
+  — here, `db` (checks the `DataSource` can actually get a connection,
+  not just that it exists) and `diskSpace` — and rolls them up into one
+  overall `UP`/`DOWN`. Adding, say, a Redis or external-API dependency
+  later would add another named component to this same aggregate
+  automatically, no wiring required beyond adding that dependency.
+- `show-details=always` returns each component's full detail (e.g. `db`'s
+  database type and validation query). This is *not* a safe default for a
+  publicly reachable health endpoint in general — detail can leak internal
+  topology (what's this app actually connected to). It's set to `always`
+  here specifically *because* health is only reachable on the isolated
+  management port; the same setting on a publicly-exposed health endpoint
+  would be a real information-disclosure choice, not a neutral one.
+- **Liveness vs. readiness are not the same question**, and conflating them
+  is a genuine, common production incident pattern: *liveness*
+  (`/actuator/health/liveness`) answers "is this process broken and should
+  be killed and restarted" — a deadlock, an unrecoverable internal state.
+  *Readiness* (`/actuator/health/readiness`) answers "should traffic be
+  routed to this instance right now" — e.g. still warming up, or the
+  database is temporarily unreachable but the process itself is fine. If
+  an orchestrator's liveness probe were wired to the same check as
+  readiness, a transient DB blip would cause Kubernetes to *kill and
+  restart* healthy application instances that just happen to be unable to
+  reach the database at that moment — restarting the app does nothing to
+  fix a database outage, and adds restart-storm load on top of an already
+  degraded dependency. `management.endpoint.health.probes.enabled=true`
+  exposes both groups separately specifically so an orchestrator's
+  liveness and readiness probes can (and should) point at different URLs
+  with different consequences.
+
+## `/actuator/info`: two different data sources, one endpoint
+
+- The `app.*` section comes from plain `info.*` properties in
+  `application.properties` (`info.app.name`, `info.app.description`) —
+  static values, known at deploy-config time.
+- The `build.*` section comes from `target/classes/META-INF/build-info.properties`,
+  which does not exist until `spring-boot-maven-plugin`'s `build-info` goal
+  actually runs (bound to the `prepare-package` phase) — verified this
+  distinction concretely: `mvn compile` alone does not produce it,
+  `mvn package` (or `spring-boot:run`, which triggers the full lifecycle up
+  through packaging) does. If `/actuator/info` ever shows an empty `build`
+  section, the build metadata was never generated for that run, not a
+  configuration bug in the endpoint itself.
+- `management.info.env.enabled` is `false` by default in Spring Boot, and
+  had to be explicitly turned on here to get the `info.*` properties
+  showing at all under `management.info.env.enabled=true` — a deliberate
+  framework default, not an oversight: arbitrary environment/config
+  properties can contain secrets, so "show config values on an operational
+  endpoint" is opt-in, not opt-out.
+
+## Metrics: two endpoints for two different jobs
+
+- `/actuator/metrics` (and `/actuator/metrics/{name}`) is a live,
+  point-in-time JSON snapshot — good for "what is this one number right
+  now" during manual debugging, bad for anything needing history (there's
+  no storage; ask again in five minutes and the previous value is gone).
+- `/actuator/prometheus` exposes the same underlying Micrometer registry in
+  Prometheus's text exposition format — meant to be *scraped* on an
+  interval by a Prometheus server (or compatible agent), which is what
+  actually turns point-in-time numbers into the time series a dashboard or
+  alert rule needs. Added `micrometer-registry-prometheus` specifically for
+  this: without a registry implementation on the classpath, Micrometer has
+  metrics internally but nothing to format them for scraping. The two
+  endpoints aren't redundant — `/metrics` is for a human looking right now,
+  `/prometheus` is for a scraper building history.
+
+## Loggers: runtime log-level changes, no redeploy
+
+- `/actuator/loggers/{name}` reads/writes the underlying Logback logging
+  system's level for that logger name through Spring Boot's
+  `LoggingSystem` abstraction — verified live: `POST` with
+  `{"configuredLevel":"DEBUG"}` against `com.app.ecom` took effect
+  immediately (`effectiveLevel` changed on the next `GET`), no restart.
+  Real operational value: turning on `DEBUG` for one noisy area (or
+  `org.hibernate.SQL` to see live queries) during an active incident,
+  without a redeploy — and turning it back off just as fast once done.
+- It's still a write operation reachable by anyone who can reach the
+  management port, same as `shutdown` in kind if not in severity — flooding
+  logs with `TRACE` across the whole app, or silencing a logger an operator
+  is relying on, are both real (if less catastrophic than `shutdown`)
+  things an unauthorized caller could do. Same isolation boundary applies;
+  there's no separate, lighter-weight protection for this one.
+
+## `beans` and `env`: why they're excluded from "safe to make public" even in spirit
+
+- `/actuator/beans` (375 beans in this app) dumps the entire Spring
+  application context — every bean's class, scope, and dependency graph.
+  Not a secret in the sense of credentials, but a complete map of the
+  app's internal structure that a real attacker would otherwise have to
+  infer from behavior — handed over directly.
+- `/actuator/env` dumps every resolved configuration property from every
+  property source. In *this* app, that's relatively harmless (H2 in
+  memory, no real credentials in `application.properties`). In any
+  deployment with a real external database, message queue, or third-party
+  API key configured via environment variables or a properties file, this
+  endpoint would hand over exactly those secrets in plaintext. It behaves
+  identically regardless of whether the underlying config happens to be
+  sensitive — the endpoint doesn't know the difference, so the protection
+  has to come from where it's reachable, not from the endpoint itself.
+
+## Why not Spring Security here, and what changes if it's added later
+
+- Declined via AskUserQuestion in favor of port isolation, for reasons
+  worth restating precisely: this app has **zero** existing authentication
+  anywhere (every one of the 20+ `/api/**` endpoints is already
+  unauthenticated by design, documented repeatedly throughout this file).
+  Adding `spring-boot-starter-security` changes that landscape the moment
+  it's on the classpath — Spring Security's auto-configuration secures
+  *everything* by default and generates a random login password at
+  startup, unless a `SecurityFilterChain` explicitly opts routes back out.
+  Getting that filter chain's route-matching even slightly wrong (a
+  mistyped ant-pattern, an ordering mistake between multiple chains) risks
+  either leaving `/actuator/shutdown` open anyway or accidentally locking
+  down the public API this whole project has been building — a
+  strictly worse failure mode than what port isolation risks.
+- Port isolation's honest weakness (repeated from above because it's the
+  crux of the whole decision): it depends entirely on the deployment
+  environment actually keeping port 8081 off any public path. It is a
+  real, load-bearing dependency on infrastructure that this codebase
+  cannot verify or enforce for itself.
+- **What changes when auth is eventually added**: unlike the `userId`
+  path-variable design in Cart/Order (deliberately threaded as a plain
+  parameter so only the controller layer changes later), actuator's
+  security boundary is *entirely* infrastructure/configuration — no
+  application code currently branches on "is this an authenticated
+  request." Adding Spring Security scoped to `/actuator/**` later is a
+  net-new, additive `SecurityFilterChain` bean plus the new dependency; it
+  doesn't require refactoring anything written here. The two features
+  (business-API auth, actuator auth) are independent problems that happen
+  to share one underlying tool.

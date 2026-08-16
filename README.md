@@ -3,7 +3,7 @@
 A Spring Boot e-commerce backend: users (with a saved address), a product catalog,
 a per-user cart, and order placement/cancellation with inventory tracking.
 
-- **Stack:** Java 17, Spring Boot 4.1.0 (Spring MVC + Spring Data JPA + Bean Validation), H2 (in-memory), Lombok, Maven
+- **Stack:** Java 17, Spring Boot 4.1.0 (Spring MVC + Spring Data JPA + Bean Validation + Actuator), H2 (in-memory), Micrometer/Prometheus, Lombok, Maven
 - **Architecture:** `Controller` (DTOs only) → `Mapper` (DTO ⇄ Entity) → `Service` (`@Transactional`, entities) → `Repository` (Spring Data JPA)
 - For the reasoning behind specific design choices, see [`decision.md`](decision.md) (dated decision log), [`flow.md`](flow.md) (call-flow maps per module), and [`notes.md`](notes.md) (in-depth technical deep dive).
 
@@ -30,6 +30,22 @@ The app starts on **http://localhost:8080**. The database is H2 **in-memory** �
 
 Restoring the test dependency to `pom.xml` fixes this properly; not done as part of this change since it wasn't in scope for whatever feature was being built when this was discovered.
 
+## Operations (Actuator)
+
+Operational endpoints run on a **separate port from the business API** — `8081`, not `8080`. This is the security boundary: `/actuator/**` isn't reachable on `8080`, and `/api/**` isn't reachable on `8081` (both directions verified live). In a real deployment, port `8081` must be kept off any publicly reachable network path (firewall rule, container port mapping that only publishes `8080`, k8s `NetworkPolicy`) — Spring enforces the port split, but *not* keeping that port off the public internet is the deployer's job, not something this app can guarantee on its own. See `notes.md` for the full reasoning, including why this project didn't add Spring Security instead.
+
+| Endpoint | URL | Notes |
+|---|---|---|
+| Health | `GET :8081/actuator/health` | Includes DB connectivity (`db`), disk space, and `liveness`/`readiness` groups (`/actuator/health/liveness`, `/actuator/health/readiness`) for container orchestrators. Full detail always shown — safe since only reachable on the isolated port. |
+| Info | `GET :8081/actuator/info` | App name/description plus real build metadata (artifact, version, build time) from `spring-boot-maven-plugin`'s `build-info` goal — only populated after `mvn package` (or `spring-boot:run`, which triggers it too), not a bare `mvn compile`. |
+| Metrics | `GET :8081/actuator/metrics` | Index of available metric names; `GET :8081/actuator/metrics/{name}` (e.g. `jvm.memory.used`) for one metric's detail. |
+| Prometheus | `GET :8081/actuator/prometheus` | Same metrics in Prometheus scrape format, for a real metrics pipeline rather than manual browsing. |
+| Loggers | `GET :8081/actuator/loggers/{name}` / `POST` with `{"configuredLevel":"DEBUG"}` | Change a logger's level at runtime, no restart — e.g. `com.app.ecom` or `org.hibernate.SQL`. Verified live: `INFO` → `DEBUG` took effect immediately. |
+| Beans | `GET :8081/actuator/beans` | Full Spring application context dump (every bean, its type, and dependencies) — genuinely sensitive, this is why it isn't on the public port. |
+| Env | `GET :8081/actuator/env` | All resolved configuration properties. Would include real secrets in a production config (DB passwords, API keys) — never expose this publicly. |
+| Mappings | `GET :8081/actuator/mappings` | Every registered `@RequestMapping`, useful for confirming what's actually wired up. |
+| Shutdown | `POST :8081/actuator/shutdown` | Gracefully stops the application. **Disabled by the framework by default even when exposed** — this app explicitly opts it in (`management.endpoint.shutdown.access=unrestricted`) because it was asked for, but it's the single most dangerous endpoint in this list (trivial denial-of-service if ever reachable publicly). Prefer letting an orchestrator send `SIGTERM` in real deployments — `server.shutdown=graceful` is configured so that triggers the same graceful drain (30s timeout) without needing this endpoint at all. |
+
 ## Data model quick reference
 
 | Entity | Key fields | Notes |
@@ -47,7 +63,7 @@ Restoring the test dependency to `pom.xml` fixes this properly; not done as part
 
 ## Error response format
 
-Every 4xx/5xx from a handled exception returns this shape (`GlobalExceptionHandler`, `com.app.ecom.exception`):
+Every 4xx/5xx from a handled exception returns this shape (`GlobalExceptionHandler`, `com.app.ecom.common.exception`):
 
 ```json
 {
